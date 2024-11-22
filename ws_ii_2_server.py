@@ -1,33 +1,32 @@
+import sys
+import time
+from datetime import datetime
+import random
+import string
+import hashlib
 import asyncio
 import websockets
 import redis.asyncio as redis
-import json
-import random
-import string
-import sys, os
-import hashlib
 
-# Connexion Redis
-clients = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
-clients_websocket = {}
-
+# ===== CONSTANTS =====
 REDIS_USERS_KEY = "user:"
+REDIS_MESSAGES_KEY = "message:"
+REDIS_MESSAGES_SORTED_LIST_KEY = REDIS_MESSAGES_KEY + "timestamps"
 
-MSG_JOIN_CHAT = "Annonce : {} a rejoint la chatroom"
-MSG_LEAVE_CHAT = "Annonce : {} a quitté la chatroom"
-MSG_SEND_CHAT = "{} a dit : {}"
-MSG_SEND_SELF_CHAT = "Vous avez dit : {}"
-MSG_PSEUDO_UNAVAILABLE = "Le pseudo {} est déjà utilisé"
-MSG_PSEUDO_UNAVAILABLE = "Le pseudo {} est déjà utilisé"
+HISTORY_TOP_DESIGN = f"{'*' * 10} HISTORY {'*' * 10}"
+HISTORY_BOTTOM_DESIGN = "*" * len(HISTORY_TOP_DESIGN)
 
-MSG_WRONG_PASSWORD = "Mauvais mot de passe"
-MSG_PASSWORD_NOT_SET = "Veuillez définir un mot de passe"
-
-MSG_WRONG_SESSION = "Erreur de session"
-MSG_PLEASE_LOGIN = "Veuillez vous connecter"
-MSG_WELCOME = "Vous êtes maintenant inscrit"
-MSG_ERROR = "Une erreur a eu lieu"
-MSG_ALREADY_CONNECTED = "Ce pseudo est déjà connecté"
+MSG_JOIN_CHAT = "ʕっ•ᴥ•ʔっ ( {} as join ! )"
+MSG_LEAVE_CHAT = "ʕっ•ᴥ•ʔっ ( {} as left ! )"
+MSG_SEND_CHAT = "{} : {}"
+MSG_PSEUDO_UNAVAILABLE = "Name {} is already registered"
+MSG_WRONG_PASSWORD = "ʕノ•̀ᴥ•́ʔノ ( Wrong password )"
+MSG_PASSWORD_NOT_SET = "ʕ¬ᴥ¬ʔ ( Please define your password )"
+MSG_WRONG_SESSION = "ʕ°ᴥ°ʔ ( Session error )"
+MSG_REGISTER = "ʕᵔᴥᵔʔノ ( You are registered, welcome ! )"
+MSG_LOGIN = "ʕᵔᴥᵔʔノ ( Welcome back {} ! )"
+MSG_ERROR = "ʕ°ᴥ°ʔ ( An error occured ! )"
+MSG_ALREADY_CONNECTED = "ʕಠᴥಠʔ ( This name is already connected )"
 
 HEADER_NEWPASS = "NEWPASS"
 HEADER_PASS = "PASS"
@@ -37,175 +36,221 @@ SYS_NEWPASS_TOKEN = HEADER_NEWPASS + "|{}"
 SYS_PASS_TOKEN = HEADER_PASS + "|{}"
 
 
+# ===== GLOBAL FUNCTIONS =====
 def generate_token():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    """
+    Return a 16 length string with random [A-Z][a-z][0-9]
+    """
+    return ''.join(random.choices(string.ascii_uppercase + string.ascii_lowercase + string.digits, k=16))
 
-def generate_random_rgb():
-    return (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+def generate_random_rgb_hexa():
+    """
+    Return a random color in hexadecimal format #RRGGBB
+    """
+    color = random.randrange(0, 2**24)
+    hex_color = hex(color)
+    return f"#{hex_color[2:]}"
 
-def get_pseudo_colored(pseudo:str, rgb:tuple):
-    return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m{pseudo}\033[0m"
+def get_pseudo_colored(pseudo: str, rgb: str):
+    """
+    Return a formatted string for color in terminal
+    """
+    return f"&{rgb}&l{pseudo}&r&f"
 
-def hashPassword(password):
+def hash_string(password):
+    """
+    Return hashed string password in SHA256
+    """
     return hashlib.sha256(password.encode()).hexdigest()
 
-async def checkPassword(password, hash):
-    return hashPassword(password) == hash
+async def check_password(password, hashed_password):
+    """
+    Compare password with hash
+    """
+    return hash_string(password) == hashed_password
 
-async def send_to_clients(message:str, addr:str, *args:tuple, exclude_self = True):
-    global clients_websocket
-    
-    stringFormatted = message.format(*args)
+
+# ===== MESSAGES FUNCTIONS =====
+async def send_to_clients(redis_client, message: str, addr: str, clients_websocket: dict, *args: tuple, exclude_self=True):
+    """
+    Send message to all clients
+    """
+    date_time = datetime.now().strftime("[%m/%d/%Y, %H:%M:%S] ")
+    string_formatted = date_time + message.format(*args) + "&r"
+    await save_message(redis_client, string_formatted)
+
     for other_key, other_ws in clients_websocket.items():
         if exclude_self and other_key == addr:
             continue
-        await other_ws.send(stringFormatted)
+        await other_ws.send(string_formatted)
 
-async def send_to_client(ws, message:str, *args:tuple):
-    stringFormatted = message.format(*args)
-    await ws.send(stringFormatted)
-        
+async def send_to_client(ws, message: str, *args: tuple):
+    """
+    Send message to specific client
+    """
+    string_formatted = message.format(*args)
+    await ws.send(string_formatted)
 
-async def handle_client_msg(websocket):
+async def save_message(redis_client, message):
     """
-    Gère les messages reçus d'un client via WebSocket.
+    Save message to history
     """
+    message_data = {
+        "content": message,
+        "time": time.time()
+    }
+
+    message_id = hash_string(message)
+    await redis_client.hset(REDIS_MESSAGES_KEY + message_id, mapping=message_data)
+    await redis_client.zadd(REDIS_MESSAGES_SORTED_LIST_KEY, {message_id: message_data["time"]})
+
+async def get_last_messages(redis_client, count=10):
+    """
+    Get last <count> messages of chat
+    """
+    message_ids = await redis_client.zrange(REDIS_MESSAGES_SORTED_LIST_KEY, 0, count - 1)
+
+    messages = []
+    for message_id in message_ids:
+        message_data = await redis_client.hgetall(REDIS_MESSAGES_KEY + message_id)
+        messages.append(message_data["content"])
+
+    return messages
+
+async def handle_client_msg(websocket, redis_client, clients_websocket):
+    """
+    Handle all message from clients
+    """
+
     addr = websocket.remote_address
     print(f"Nouvelle connexion de {addr}")
 
     try:
-        # Enregistrer le websocket
         clients_websocket[addr] = websocket
 
         message = await websocket.recv()
-        print(f"Message reçu de {addr} : {message}")
+        print(f"Message from {addr} : {message}")
 
         current_client_pseudo = ''
 
         if f"{HEADER_HELLO}|" in message and len(message.split(f"{HEADER_HELLO}|")) > 1:
-            print("super GIGA TEST")
             auth_token = generate_token()
-            current_client_pseudo = message.split(f"{HEADER_HELLO}|")[1]
+            current_client_pseudo = message.split(f"{HEADER_HELLO}|")[1].lower()
             current_client = {}
 
-            user_exists = await clients.exists(REDIS_USERS_KEY + current_client_pseudo)
-            # Si le compte utilisateur existe déjà
+            user_exists = await redis_client.exists(REDIS_USERS_KEY + current_client_pseudo)
             if user_exists == 1:
-                pseudo_account = await clients.hgetall(REDIS_USERS_KEY + current_client_pseudo)
-                if bool(int(pseudo_account.get("connected", 0))) == False:
+                pseudo_account = await redis_client.hgetall(REDIS_USERS_KEY + current_client_pseudo)
+                if not bool(int(pseudo_account.get("connected", 0))):
                     pseudo_account["auth_token"] = auth_token
-
-                    await clients.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=pseudo_account)
-                    await send_to_client(websocket, SYS_PASS_TOKEN, (pseudo_account["auth_token"]))
+                    await redis_client.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=pseudo_account)
+                    await send_to_client(websocket, SYS_PASS_TOKEN, pseudo_account["auth_token"])
                 else:
-                    await send_to_client(websocket, MSG_ALREADY_CONNECTED, ())
+                    await send_to_client(websocket, MSG_ALREADY_CONNECTED)
             else:
-                # Sauvegarder le pseudo
                 current_client["pseudo"] = current_client_pseudo
-
-                # Sauvegarder la couleur
-                color = generate_random_rgb()
-                current_client["color"] = json.dumps(color)
-
-                # Sauvegarder le token d'auth
+                current_client["color"] = generate_random_rgb_hexa()
                 current_client["auth_token"] = auth_token
-
-                # Définir le nouveau compte comme non connecté
                 current_client["connected"] = int(False)
 
-                await clients.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=current_client)
-                print(f"Utilisateur {current_client['pseudo']} sauvegardé !")
+                await redis_client.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=current_client)
+                await send_to_client(websocket, SYS_NEWPASS_TOKEN, current_client["auth_token"])
 
-                await send_to_client(websocket, SYS_NEWPASS_TOKEN, (current_client["auth_token"]))
-
-
-        current_client = await clients.hgetall(REDIS_USERS_KEY + current_client_pseudo)
-        current_client_color = json.loads(current_client.get("color"))
+        current_client = await redis_client.hgetall(REDIS_USERS_KEY + current_client_pseudo)
+        current_client_color = current_client.get("color")
         current_client_isConnected = bool(int(current_client.get("connected", 0)))
-        current_client_authToken = current_client.get("auth_token")
 
+        print("supra test ", current_client_color)
         current_client_pseudoColored = get_pseudo_colored(current_client_pseudo, current_client_color)
 
         while True:
             message = await websocket.recv()
-            if current_client_isConnected == False and (HEADER_NEWPASS in message or HEADER_PASS in message):
-                # Récupération du mdp entré par l'user et du token de session
+            if not current_client_isConnected and (HEADER_NEWPASS in message or HEADER_PASS in message):
                 message_data = message.split("|")
-                if len(message_data) == 3: # NEWPASS/PASS | auth_token | client_password
-                    client_header = message_data[0]
-                    client_auth_token = message_data[1]
-                    client_password = message_data[2]
-                    
-                    if len(client_password) == 0:
-                        await send_to_client(websocket, MSG_PASSWORD_NOT_SET, ())
-                        if client_header == HEADER_NEWPASS:
-                            await send_to_client(websocket, SYS_NEWPASS_TOKEN, (client_auth_token))
-                            continue
+                if len(message_data) == 3: # NEWPASS/PASS | auth_token | password
+                    client_header, client_auth_token, client_password = message_data
 
-                        elif client_header == HEADER_PASS:
-                            await send_to_client(websocket, SYS_PASS_TOKEN, (client_auth_token))
-                            continue
+                    if not client_password:
+                        await send_to_client(websocket, MSG_PASSWORD_NOT_SET)
+                        token_msg = SYS_NEWPASS_TOKEN if client_header == HEADER_NEWPASS else SYS_PASS_TOKEN
+                        await websocket.close()
+                        return
 
-                    elif client_auth_token != current_client_authToken:
-                        await send_to_client(websocket, MSG_WRONG_SESSION, ())
-                        continue
+                    if client_auth_token != current_client.get("auth_token"):
+                        await send_to_client(websocket, MSG_WRONG_SESSION)
+                        await websocket.close()
+                        return
 
-                    else:
-                        # Si c'est une inscription
-                        if client_header == HEADER_NEWPASS:
-                            current_client["password"] = hashPassword(client_password)
-                            await send_to_client(websocket, MSG_WELCOME, ())
+                    if client_header == HEADER_NEWPASS:
+                        current_client["password"] = hash_string(client_password)
+                        await send_to_client(websocket, MSG_REGISTER)
 
-                        # Si c'est une connexion
-                        elif client_header == HEADER_PASS:
-                            if not await checkPassword(client_password, current_client["password"]):
-                                await send_to_client(websocket, MSG_WRONG_PASSWORD, ())
-                                await send_to_client(websocket, SYS_PASS_TOKEN, (client_auth_token))
-                                continue
+                    elif client_header == HEADER_PASS:
+                        if not await check_password(client_password, current_client["password"]):
+                            await send_to_client(websocket, MSG_WRONG_PASSWORD)
+                            await websocket.close()
+                            return
 
-                        current_client["connected"] = int(True)
-                        current_client_isConnected = True
+                        await send_to_client(websocket, MSG_LOGIN, (current_client_pseudoColored))
 
-                        current_client["auth_token"] = ''
-                        current_client_authToken = ''
-                        await clients.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=current_client)
+                    current_client["connected"] = int(True)
+                    current_client_isConnected = True
 
-                        await send_to_clients(MSG_JOIN_CHAT, addr, (current_client_pseudoColored), exclude_self=False)
-                        continue
-                else:
-                    await send_to_client(websocket, MSG_ERROR, ())
+                    current_client["auth_token"] = ''
+                    await redis_client.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=current_client)
+
+                    last_messages = await get_last_messages(redis_client)
+                    history_message = HISTORY_TOP_DESIGN + "\n" + "\n".join(last_messages) + "\n" + HISTORY_BOTTOM_DESIGN
+                    await send_to_client(websocket, history_message)
+
+                    await send_to_clients(redis_client, MSG_JOIN_CHAT, addr, clients_websocket, current_client_pseudoColored, exclude_self=False)
                     continue
+                else:
+                    await send_to_client(websocket, MSG_ERROR)
+                    await websocket.close()
+                    return
 
-            if current_client_isConnected == True and current_client_authToken == '':
-                print(f"Message reçu de {current_client_pseudo} : {message}")
-                await send_to_clients(MSG_SEND_CHAT, current_client_pseudo, *(current_client_pseudoColored, message))
+            if current_client_isConnected and current_client.get("auth_token") == '':
+                await send_to_clients(redis_client, MSG_SEND_CHAT, current_client_pseudo, clients_websocket, current_client_pseudoColored, message)
             else:
-                await send_to_client(websocket, MSG_PASSWORD_NOT_SET, ())
+                await send_to_client(websocket, MSG_PASSWORD_NOT_SET)
+                await websocket.close()
+                return
 
     except websockets.exceptions.ConnectionClosed:
-        print(f"Connexion fermée par {addr}")
+        print(f"Connection closed from {addr}")
     except Exception as e:
         exc_type, exc_obj, exc_tb = sys.exc_info()
-        print(f"Erreur : {e} (Type: {exc_type}, Ligne: {exc_tb.tb_lineno})")
+        print(f"Error : {e} (Type: {exc_type}, Line: {exc_tb.tb_lineno})")
     finally:
         if addr in clients_websocket:
             del clients_websocket[addr]
 
-        if await clients.exists(REDIS_USERS_KEY + current_client_pseudo) == 1:
+        if await redis_client.exists(REDIS_USERS_KEY + current_client_pseudo) == 1:
             current_client["connected"] = int(False)
-            await clients.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=current_client)
-            await send_to_clients(MSG_LEAVE_CHAT, addr, (current_client_pseudoColored))
-
-
+            await redis_client.hset(REDIS_USERS_KEY + current_client_pseudo, mapping=current_client)
+            await send_to_clients(redis_client, MSG_LEAVE_CHAT, addr, clients_websocket, current_client_pseudoColored)
 
 async def main():
     """
-    Lancer le serveur WebSocket.
+    Will start our websocket chat server
     """
-    async with websockets.serve(handle_client_msg, "127.0.0.1", 8888):
-        print("Serveur démarré sur ws://127.0.0.1:8888")
-        await asyncio.Future()
 
+    # Redis connection
+    redis_client = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
+    try:
+        await redis_client.ping()
+        print("Successful Redis connection")
+    except Exception as e:
+        print(f"Error, unable to connect to Redis : {e}")
+        return
+
+    # Store our websockets connections
+    clients_websocket = {}
+
+    async with websockets.serve(lambda ws: handle_client_msg(ws, redis_client, clients_websocket), "127.0.0.1", 8888):
+        print("Server listen on ws://127.0.0.1:8888")
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
