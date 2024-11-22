@@ -24,8 +24,7 @@ async def handle_client_msg(websocket):
 
                 for client_addr, client_data in CLIENTS.items():
                     if client_addr != addr:
-                        client_data["websocket"].send(
-                            f"Annonce : {pseudo} a rejoint la chatroom".encode())
+                        client_data["websocket"].send(f"Annonce : {pseudo} a rejoint la chatroom".encode())
         else:
             pseudo = CLIENTS[addr]["pseudo"]
 

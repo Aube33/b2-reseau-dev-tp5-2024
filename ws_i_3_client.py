@@ -9,7 +9,7 @@ async def receive_responses(websocket):
     while True:
         try:
             data = await websocket.recv()
-            print("#", data.decode())
+            print("#", data)
         except websockets.ConnectionClosed:
             print("Annonce : Le serveur est hors ligne")
             return
